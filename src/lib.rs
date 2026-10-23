@@ -102,19 +102,34 @@ const LABEL_TYPE_POINTER: u8 = 0xC0;
 /// Decodes a DNS name in RFC 1035 wire format into its dotted representation,
 /// e.g. `b"\x06google\x03com\0"` becomes `b"google.com"`.
 ///
-/// `input` is the slice at which the name starts. Any bytes following the
-/// terminating zero-length label are ignored, so `input` may simply extend to
-/// the end of the packet. `_backlog` is currently unused.
+/// `input` is the slice at which the name starts and `backlog` is the packet
+/// containing it. Compression pointers (RFC 1035 section 4.1.4) are resolved
+/// against `backlog`, which requires `input` to be a subslice of `backlog`;
+/// when it is not, names containing pointers are rejected. Any bytes following
+/// the end of the name are ignored, so `input` may simply extend to the end of
+/// the packet.
 ///
-/// Returns `None` when `input` does not hold a well-formed name: it is
-/// truncated, a label is of a reserved type, the name is empty, or the decoded
-/// name would be longer than [`MAX_NAME_LEN`] bytes.
+/// A pointer is only accepted when it refers to data *before* the portion of
+/// the packet currently being decoded: before `input` for the first pointer,
+/// and before the previous pointer's target for every subsequent one. This is
+/// what RFC 1035 calls "a prior occurrence of the same name". It rules out
+/// forward references and pointer loops, and guarantees termination because
+/// every jump strictly lowers the position being decoded.
+///
+/// Returns `None` when the name is not well-formed: it is truncated, a label
+/// is of a reserved type, a pointer cannot be followed, the name is empty, or
+/// the decoded name would be longer than [`MAX_NAME_LEN`] bytes.
 ///
 /// Label bytes are copied verbatim; no escaping is performed for labels that
 /// themselves contain a period or other special characters.
-pub fn decode_dns_name(input: &[u8], _backlog: &[u8]) -> Option<Box<[u8]>> {
+pub fn decode_dns_name(input: &[u8], backlog: &[u8]) -> Option<Box<[u8]>> {
     let mut out: Vec<u8> = Vec::new();
     let mut cursor = input;
+    // Pointers may only refer to positions in `backlog` strictly below this
+    // bound. It starts at the position of `input` within `backlog` (`None` if
+    // `input` is not part of `backlog`) and moves down with every pointer
+    // that is followed.
+    let mut pointer_bound = backlog.subslice_range(input).map(|range| range.start);
 
     loop {
         let (&first, rest) = cursor.split_first()?;
@@ -147,8 +162,16 @@ pub fn decode_dns_name(input: &[u8], _backlog: &[u8]) -> Option<Box<[u8]>> {
                 cursor = rest;
             }
             LABEL_TYPE_POINTER => {
-                // Compression pointers are not supported (yet).
-                return None;
+                let (&second, _) = rest.split_first()?;
+                let target = usize::from(u16::from_be_bytes([first & !LABEL_TYPE_MASK, second]));
+
+                if target >= pointer_bound? {
+                    return None;
+                }
+                // `target < pointer_bound <= backlog.len()`, so this cannot
+                // fail; `get` merely avoids a panicking index.
+                cursor = backlog.get(target..)?;
+                pointer_bound = Some(target);
             }
             _ => {
                 // Reserved label types (RFC 1035 section 4.1.4).
@@ -161,6 +184,7 @@ pub fn decode_dns_name(input: &[u8], _backlog: &[u8]) -> Option<Box<[u8]>> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::HashMap;
 
     /// Convenience wrapper: decode and unwrap into a `Vec` for comparisons.
     fn decode(input: &[u8], backlog: &[u8]) -> Option<Vec<u8>> {
@@ -176,6 +200,33 @@ mod test {
         }
         out.push(0);
         out
+    }
+
+    /// Appends `labels` to `packet`, replacing the longest suffix that was
+    /// written before (according to `suffixes`) by a compression pointer.
+    /// Newly written suffixes are recorded in `suffixes`. Returns the offset
+    /// at which the name starts.
+    fn encode_compressed(
+        packet: &mut Vec<u8>,
+        labels: &[&[u8]],
+        suffixes: &mut HashMap<Vec<Vec<u8>>, usize>,
+    ) -> usize {
+        let start = packet.len();
+        for (i, label) in labels.iter().enumerate() {
+            let suffix: Vec<Vec<u8>> = labels[i..].iter().map(|l| l.to_vec()).collect();
+            if let Some(&offset) = suffixes.get(&suffix) {
+                let pointer = u16::try_from(offset).unwrap() | 0xC000;
+                packet.extend_from_slice(&pointer.to_be_bytes());
+                return start;
+            }
+            if packet.len() <= 0x3FFF {
+                suffixes.insert(suffix, packet.len());
+            }
+            packet.push(u8::try_from(label.len()).unwrap());
+            packet.extend_from_slice(label);
+        }
+        packet.push(0);
+        start
     }
 
     #[test]
@@ -363,6 +414,232 @@ mod test {
                 assert_eq!(decoded.unwrap(), expected);
             } else {
                 assert_eq!(decoded, None);
+            }
+        }
+    }
+
+    #[test]
+    fn simple_backref() {
+        let pkt = b"\x06google\x03com\0\x03www\xC0\x00";
+
+        assert_eq!(
+            decode_dns_name(&pkt[12..], &pkt[..]).as_deref().unwrap(),
+            b"www.google.com"
+        );
+    }
+
+    const README_PACKET: &[u8] =
+        b"\x0Atweedegolf\x02nl\0\x08mailcrab\xC0\x00\x04mail\xC0\x00\x06secret\xC0\x0F";
+
+    #[test]
+    fn readme_packet() {
+        let pkt = README_PACKET;
+        assert_eq!(decode(&pkt[0..], pkt).unwrap(), b"tweedegolf.nl");
+        assert_eq!(decode(&pkt[15..], pkt).unwrap(), b"mailcrab.tweedegolf.nl");
+        assert_eq!(decode(&pkt[26..], pkt).unwrap(), b"mail.tweedegolf.nl");
+        // Follows a chain of two pointers.
+        assert_eq!(
+            decode(&pkt[33..], pkt).unwrap(),
+            b"secret.mailcrab.tweedegolf.nl"
+        );
+    }
+
+    #[test]
+    fn name_consisting_of_only_a_pointer() {
+        let mut pkt = README_PACKET.to_vec();
+        pkt.extend_from_slice(b"\xC0\x0F");
+        let start = pkt.len() - 2;
+        assert_eq!(
+            decode(&pkt[start..], &pkt).unwrap(),
+            b"mailcrab.tweedegolf.nl"
+        );
+    }
+
+    #[test]
+    fn pointer_to_terminator() {
+        let pkt = b"\x03com\0\x03www\xC0\x04\xC0\x04";
+        assert_eq!(decode(&pkt[5..], pkt).unwrap(), b"www");
+        // A name made up of a pointer to a terminator only is empty.
+        assert_eq!(decode(&pkt[11..], pkt), None);
+    }
+
+    #[test]
+    fn pointer_uses_all_fourteen_bits() {
+        // Put the referenced name beyond offset 255 so that the high bits of
+        // the pointer matter.
+        let mut pkt = vec![0u8; 300];
+        pkt.extend_from_slice(b"\x03com\0");
+        let start = pkt.len();
+        pkt.extend_from_slice(b"\x03www\xC1\x2C"); // 0x012C == 300
+        assert_eq!(decode(&pkt[start..], &pkt).unwrap(), b"www.com");
+    }
+
+    #[test]
+    fn truncated_pointer() {
+        let pkt = b"\x03com\0\x03www\xC0";
+        assert_eq!(decode(&pkt[5..], pkt), None);
+    }
+
+    #[test]
+    fn pointer_without_packet() {
+        let name = b"\x03www\xC0\x00";
+        assert_eq!(decode(name, &[]), None);
+        // The packet does not contain `input`, so there is nothing to
+        // resolve the pointer against.
+        assert_eq!(decode(name, b"\x03com\0"), None);
+    }
+
+    #[test]
+    fn pointer_beyond_packet() {
+        let pkt = b"\x03com\0\x03www\xC0\x20\x03www\xFF\xFF";
+        assert_eq!(decode(&pkt[5..], pkt), None);
+        assert_eq!(decode(&pkt[11..], pkt), None);
+    }
+
+    #[test]
+    fn forward_pointer() {
+        // A lenient decoder would produce "www.com"; RFC 1035 only allows
+        // pointers to prior occurrences.
+        let pkt = b"\x03aaa\0\x03www\xC0\x0B\x03com\0";
+        assert_eq!(decode(&pkt[5..], pkt), None);
+        assert_eq!(decode(&pkt[11..], pkt).unwrap(), b"com");
+    }
+
+    #[test]
+    fn pointer_to_itself() {
+        let pkt = b"\x03www\xC0\x04";
+        assert_eq!(decode(&pkt[0..], pkt), None);
+        assert_eq!(decode(&pkt[4..], pkt), None);
+    }
+
+    #[test]
+    fn pointer_into_current_name() {
+        // Pointer back to the start of the name it is part of.
+        let pkt = b"\x03www\xC0\x00";
+        assert_eq!(decode(&pkt[0..], pkt), None);
+    }
+
+    #[test]
+    fn pointer_loop_through_earlier_label() {
+        // Decoding from offset 2 jumps back to 0, reads "a" and arrives at
+        // the same pointer again. The pointer does point backwards, so a
+        // decoder that only checks that would loop forever.
+        let pkt = b"\x01a\xC0\x00";
+        assert_eq!(decode(&pkt[2..], pkt), None);
+    }
+
+    #[test]
+    fn mutually_referencing_pointers() {
+        let pkt = b"\xC0\x02\xC0\x00";
+        assert_eq!(decode(&pkt[0..], pkt), None);
+        assert_eq!(decode(&pkt[2..], pkt), None);
+    }
+
+    #[test]
+    fn pointer_into_middle_of_label() {
+        // Pointers into the middle of a label cannot be detected without
+        // parsing the whole packet; whatever is found there is decoded.
+        let pkt = b"\x02\x01a\0\xC0\x01";
+        assert_eq!(decode(&pkt[0..], pkt).unwrap(), b"\x01a");
+        assert_eq!(decode(&pkt[4..], pkt).unwrap(), b"a");
+    }
+
+    #[test]
+    fn name_length_limit_spans_pointers() {
+        let long = [b'a'; 63];
+
+        // 191 bytes at offset 0, then 63 + 1 + 191 == 255 bytes: fine.
+        let mut pkt = encode(&[&long, &long, &long]);
+        let start = pkt.len();
+        pkt.push(63);
+        pkt.extend_from_slice(&long);
+        pkt.extend_from_slice(b"\xC0\x00");
+        assert_eq!(decode(&pkt[start..], &pkt).unwrap().len(), MAX_NAME_LEN);
+
+        // 255 bytes at offset 0, then 1 + 1 + 255 == 257 bytes: too long.
+        let mut pkt = encode(&[&long, &long, &long, &long]);
+        let start = pkt.len();
+        pkt.extend_from_slice(b"\x01b\xC0\x00");
+        assert_eq!(decode(&pkt[start..], &pkt), None);
+    }
+
+    #[test]
+    fn random_compressed_packets_round_trip() {
+        const POOL: &[&[u8]] = &[
+            b"a",
+            b"bb",
+            b"www",
+            b"mail",
+            b"mailcrab",
+            b"tweedegolf",
+            b"golf",
+            b"nl",
+            b"com",
+            b"example",
+            b"secret",
+            b"xn--bcher-kva",
+        ];
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+
+        for _ in 0..500 {
+            let mut packet = Vec::new();
+            let mut suffixes = HashMap::new();
+            let mut names: Vec<(usize, Vec<u8>)> = Vec::new();
+
+            for _ in 0..1 + rng.below(40) {
+                // Some unrelated bytes between names, like a real packet has.
+                for _ in 0..rng.below(6) {
+                    packet.push(rng.below(256) as u8);
+                }
+
+                let label_count = 1 + rng.below(8);
+                let labels: Vec<Vec<u8>> = (0..label_count)
+                    .map(|_| {
+                        if rng.below(4) == 0 {
+                            (0..1 + rng.below(20))
+                                .map(|_| rng.below(256) as u8)
+                                .collect()
+                        } else {
+                            POOL[rng.below(POOL.len())].to_vec()
+                        }
+                    })
+                    .collect();
+                let refs: Vec<&[u8]> = labels.iter().map(Vec::as_slice).collect();
+
+                let start = encode_compressed(&mut packet, &refs, &mut suffixes);
+                names.push((start, refs.join(&b'.')));
+            }
+
+            for (start, expected) in &names {
+                assert_eq!(
+                    decode(&packet[*start..], &packet).as_ref(),
+                    Some(expected),
+                    "packet {packet:?} at offset {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_packets_never_panic() {
+        let mut rng = XorShift(0x0123_4567_89AB_CDEF);
+        let mut packet = Vec::new();
+        for _ in 0..20_000 {
+            let len = 1 + rng.below(400);
+            packet.clear();
+            for _ in 0..len {
+                let b = match rng.below(6) {
+                    0 => rng.below(256) as u8,
+                    1 => 0,
+                    2 => 0xC0 | rng.below(2) as u8,
+                    _ => rng.below(8) as u8,
+                };
+                packet.push(b);
+            }
+            let start = rng.below(packet.len());
+            if let Some(output) = decode(&packet[start..], &packet) {
+                assert!(!output.is_empty());
+                assert!(output.len() <= MAX_NAME_LEN);
             }
         }
     }
